@@ -1,0 +1,7 @@
+{
+  "name": "mesh-simplifier",
+  "version": "0.1.0",
+  "dependencies": [
+    "meshoptimizer"
+  ]
+}
