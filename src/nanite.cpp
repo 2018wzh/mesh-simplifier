@@ -10,14 +10,13 @@
 #include <algorithm>
 #include <vector>
 
+#include "mesh_types.h"
+#include "nanite_api.h"
+
+#include <stdint.h>
+
 #define CLUSTERLOD_IMPLEMENTATION
 #include "clusterlod.h"
-
-struct Vertex {
-    float px, py, pz;
-    float nx, ny, nz;
-    float tx, ty;
-};
 
 // computes approximate (perspective) projection error of a cluster in screen space (0..1; multiply
 // by screen height to get pixels) camera_proj is projection[1][1], or cot(fovy/2); camera_znear is
@@ -30,6 +29,249 @@ static float boundsError(const clodBounds &bounds, float camera_x, float camera_
           dz = bounds.center[2] - camera_z;
     float d  = sqrtf(dx * dx + dy * dy + dz * dz) - bounds.radius;
     return bounds.error / (d > camera_znear ? d : camera_znear) * (camera_proj * 0.5f);
+}
+
+static uint64_t hash_bytes(const void *data, size_t size, uint64_t seed = 1469598103934665603ull) {
+    const unsigned char *p = static_cast<const unsigned char *>(data);
+    const uint64_t prime   = 1099511628211ull;
+    uint64_t h             = seed;
+    for (size_t i = 0; i < size; ++i) {
+        h ^= uint64_t(p[i]);
+        h *= prime;
+    }
+    return h;
+}
+
+static uint64_t mesh_hash(const Mesh &mesh) {
+    uint64_t h = hash_bytes(mesh.vertices.data(), mesh.vertices.size() * sizeof(Vertex));
+    h          = hash_bytes(mesh.indices.data(), mesh.indices.size() * sizeof(unsigned int), h);
+    return h;
+}
+
+struct NaniteFileHeader {
+    uint32_t magic;
+    uint32_t version;
+    uint64_t hash;
+    uint64_t vertexCount;
+    uint64_t indexCount;
+    uint64_t levelCount;
+};
+
+static const uint32_t kNaniteMagic   = 0x4e414e49; // 'NANI'
+static const uint32_t kNaniteVersion = 1;
+
+bool export_nanite(const NaniteTree &tree, const char *path) {
+    FILE *f = fopen(path, "wb");
+    if (!f)
+        return false;
+
+    NaniteFileHeader hdr = {};
+    hdr.magic            = kNaniteMagic;
+    hdr.version          = kNaniteVersion;
+    hdr.hash             = tree.hash;
+    hdr.vertexCount      = tree.source.vertices.size();
+    hdr.indexCount       = tree.source.indices.size();
+    hdr.levelCount       = tree.levels.size();
+
+    auto fail = [&](FILE *file) {
+        fclose(file);
+        return false;
+    };
+
+    if (fwrite(&hdr, sizeof(hdr), 1, f) != 1)
+        return fail(f);
+
+    if (!tree.source.vertices.empty() &&
+        fwrite(tree.source.vertices.data(), sizeof(Vertex), hdr.vertexCount, f) != hdr.vertexCount)
+        return fail(f);
+
+    if (!tree.source.indices.empty() && fwrite(tree.source.indices.data(), sizeof(unsigned int),
+                                               hdr.indexCount, f) != hdr.indexCount)
+        return fail(f);
+
+    for (size_t i = 0; i < tree.levels.size(); ++i) {
+        uint64_t tri = tree.trianglesPerLevel.size() > i ? uint64_t(tree.trianglesPerLevel[i]) : 0;
+        uint64_t clusters = uint64_t(tree.levels[i].size());
+
+        if (fwrite(&tri, sizeof(tri), 1, f) != 1)
+            return fail(f);
+        if (fwrite(&clusters, sizeof(clusters), 1, f) != 1)
+            return fail(f);
+
+        for (const auto &c : tree.levels[i]) {
+            uint64_t sz = uint64_t(c.size());
+            if (fwrite(&sz, sizeof(sz), 1, f) != 1)
+                return fail(f);
+            if (!c.empty() && fwrite(c.data(), sizeof(unsigned int), sz, f) != sz)
+                return fail(f);
+        }
+    }
+
+    fclose(f);
+    return true;
+}
+
+NaniteTree import_nanite(const char *path) {
+    NaniteTree tree;
+
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return tree;
+
+    NaniteFileHeader hdr = {};
+    if (fread(&hdr, sizeof(hdr), 1, f) != 1 || hdr.magic != kNaniteMagic ||
+        hdr.version != kNaniteVersion) {
+        fclose(f);
+        return NaniteTree();
+    }
+
+    std::vector<Vertex> vertices(hdr.vertexCount);
+    std::vector<unsigned int> indices(hdr.indexCount);
+
+    if (hdr.vertexCount &&
+        fread(vertices.data(), sizeof(Vertex), hdr.vertexCount, f) != hdr.vertexCount) {
+        fclose(f);
+        return NaniteTree();
+    }
+
+    if (hdr.indexCount &&
+        fread(indices.data(), sizeof(unsigned int), hdr.indexCount, f) != hdr.indexCount) {
+        fclose(f);
+        return NaniteTree();
+    }
+
+    tree.levels.resize(hdr.levelCount);
+    tree.trianglesPerLevel.resize(hdr.levelCount, 0);
+
+    for (size_t i = 0; i < hdr.levelCount; ++i) {
+        uint64_t tri      = 0;
+        uint64_t clusters = 0;
+        if (fread(&tri, sizeof(tri), 1, f) != 1 || fread(&clusters, sizeof(clusters), 1, f) != 1) {
+            fclose(f);
+            return NaniteTree();
+        }
+
+        tree.trianglesPerLevel[i] = size_t(tri);
+        tree.levels[i].resize(size_t(clusters));
+
+        for (size_t cidx = 0; cidx < clusters; ++cidx) {
+            uint64_t sz = 0;
+            if (fread(&sz, sizeof(sz), 1, f) != 1) {
+                fclose(f);
+                return NaniteTree();
+            }
+
+            std::vector<unsigned int> cluster(sz);
+            if (sz && fread(cluster.data(), sizeof(unsigned int), sz, f) != sz) {
+                fclose(f);
+                return NaniteTree();
+            }
+
+            tree.levels[i][cidx] = std::move(cluster);
+        }
+    }
+
+    fclose(f);
+
+    tree.source.vertices   = std::move(vertices);
+    tree.source.indices    = std::move(indices);
+    tree.originalTriangles = size_t(hdr.indexCount / 3);
+    tree.hash              = hdr.hash;
+
+    return tree;
+}
+
+NaniteTree init_mesh(const Mesh &mesh) {
+    NaniteTree tree;
+    tree.source            = mesh;
+    tree.originalTriangles = mesh.indices.size() / 3;
+    tree.hash              = mesh_hash(mesh);
+
+    if (mesh.vertices.empty() || mesh.indices.empty())
+        return tree;
+
+    clodConfig config = clodDefaultConfig(/*max_triangles=*/128);
+
+    const float attribute_weights[3] = {0.5f, 0.5f, 0.5f};
+
+    clodMesh clod                 = {};
+    clod.indices                  = mesh.indices.data();
+    clod.index_count              = mesh.indices.size();
+    clod.vertex_count             = mesh.vertices.size();
+    clod.vertex_positions         = &mesh.vertices[0].px;
+    clod.vertex_positions_stride  = sizeof(Vertex);
+    clod.vertex_attributes        = &mesh.vertices[0].nx;
+    clod.vertex_attributes_stride = sizeof(Vertex);
+    clod.attribute_weights        = attribute_weights;
+    clod.attribute_count          = sizeof(attribute_weights) / sizeof(attribute_weights[0]);
+    clod.attribute_protect_mask   = (1 << 3) | (1 << 4); // protect UV seams (tx/ty)
+
+    int groupId = 0;
+
+    clodBuild(config, clod,
+              [&](clodGroup group, const clodCluster *clusters, size_t cluster_count) -> int {
+                  size_t depth = size_t(group.depth);
+                  if (tree.levels.size() <= depth) {
+                      tree.levels.resize(depth + 1);
+                      tree.trianglesPerLevel.resize(depth + 1, 0);
+                  }
+
+                  std::vector<std::vector<unsigned int>> &level = tree.levels[depth];
+
+                  for (size_t i = 0; i < cluster_count; ++i) {
+                      const clodCluster &cluster = clusters[i];
+                      std::vector<unsigned int> indices(cluster.indices,
+                                                        cluster.indices + cluster.index_count);
+                      tree.trianglesPerLevel[depth] += cluster.index_count / 3;
+                      level.push_back(std::move(indices));
+                  }
+
+                  // Return a unique id for DAG bookkeeping; we don't use it beyond clodBuild
+                  return groupId++;
+              });
+
+    return tree;
+}
+
+Mesh simplify_mesh(const NaniteTree &tree, float ratio) {
+    Mesh result = tree.source;
+
+    if (tree.levels.empty())
+        return result;
+
+    if (!(ratio > 0.f && ratio <= 1.f))
+        ratio = 0.5f;
+
+    size_t target_triangles = size_t(std::max<size_t>(1, size_t(tree.originalTriangles * ratio)));
+
+    // Pick the deepest level whose triangle count does not exceed the target; fallback to coarsest
+    size_t chosen_level = tree.levels.size() - 1;
+    for (size_t i = 0; i < tree.trianglesPerLevel.size(); ++i) {
+        if (tree.trianglesPerLevel[i] <= target_triangles) {
+            chosen_level = i;
+            break;
+        }
+    }
+
+    const std::vector<std::vector<unsigned int>> &clusters = tree.levels[chosen_level];
+
+    size_t total_index_count = 0;
+    for (const auto &c : clusters)
+        total_index_count += c.size();
+
+    result.indices.clear();
+    result.indices.reserve(total_index_count);
+    for (const auto &c : clusters)
+        result.indices.insert(result.indices.end(), c.begin(), c.end());
+
+    if (!result.indices.empty()) {
+        meshopt_optimizeVertexCache(&result.indices[0], &result.indices[0], result.indices.size(),
+                                    result.vertices.size());
+        meshopt_optimizeVertexFetch(&result.vertices[0], &result.indices[0], result.indices.size(),
+                                    &result.vertices[0], result.vertices.size(), sizeof(Vertex));
+    }
+
+    return result;
 }
 
 static int measureComponents(std::vector<int> &parents, const std::vector<unsigned int> &indices,

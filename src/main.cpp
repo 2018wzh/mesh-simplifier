@@ -8,6 +8,9 @@
 
 #include <vector>
 
+#include "mesh_types.h"
+#include "nanite_api.h"
+
 #define FAST_OBJ_IMPLEMENTATION
 #include "fast_obj.h"
 
@@ -42,17 +45,6 @@ double timestamp() {
 #else
 double timestamp() { return double(clock()) / double(CLOCKS_PER_SEC); }
 #endif
-
-struct Vertex {
-    float px, py, pz;
-    float nx, ny, nz;
-    float tx, ty;
-};
-
-struct Mesh {
-    std::vector<Vertex> vertices;
-    std::vector<unsigned int> indices;
-};
 
 union Triangle {
     Vertex v[3];
@@ -195,6 +187,38 @@ void dumpObj(const char *section, const std::vector<unsigned int> &indices) {
 
         fprintf(stderr, "f %d//%d %d//%d %d//%d\n", a + 1, a + 1, b + 1, b + 1, c + 1, c + 1);
     }
+}
+
+bool saveObj(const char *path, const Mesh &mesh) {
+    printf("Saving mesh to %s\n", path);
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return false;
+
+    for (size_t i = 0; i < mesh.vertices.size(); ++i) {
+        const Vertex &v = mesh.vertices[i];
+        fprintf(f, "v %f %f %f\n", v.px, v.py, v.pz);
+    }
+
+    for (size_t i = 0; i < mesh.vertices.size(); ++i) {
+        const Vertex &v = mesh.vertices[i];
+        fprintf(f, "vn %f %f %f\n", v.nx, v.ny, v.nz);
+    }
+
+    for (size_t i = 0; i < mesh.vertices.size(); ++i) {
+        const Vertex &v = mesh.vertices[i];
+        fprintf(f, "vt %f %f\n", v.tx, v.ty);
+    }
+
+    for (size_t i = 0; i + 2 < mesh.indices.size(); i += 3) {
+        unsigned int a = mesh.indices[i] + 1;
+        unsigned int b = mesh.indices[i + 1] + 1;
+        unsigned int c = mesh.indices[i + 2] + 1;
+        fprintf(f, "f %u/%u/%u %u/%u/%u %u/%u/%u\n", a, a, a, b, b, b, c, c, c);
+    }
+
+    fclose(f);
+    return true;
 }
 
 struct PackedVertex {
@@ -1343,7 +1367,7 @@ bool loadMesh(Mesh &mesh, const char *path) {
         return false;
     }
 
-    printf("# %s: %d vertices, %d triangles; read in %.2f msec; indexed in %.2f msec\n", path,
+    printf("Mesh %s: %d vertices, %d triangles; read in %.2f msec; indexed in %.2f msec\n", path,
            int(mesh.vertices.size()), int(mesh.indices.size() / 3), (middle - start) * 1000,
            (end - middle) * 1000);
     return true;
@@ -1551,22 +1575,90 @@ void processNanite(const char *path) {
 }
 
 int main(int argc, char **argv) {
-    void runTests();
+    // Example: mesh-simplifier -i model.obj -r 0.35
+    const char *inputPath    = nullptr;
+    const char *outputPath   = nullptr;
+    const char *naniteImport = nullptr;
+    const char *naniteExport = nullptr;
+    float ratio              = 0.5f;
 
-    if (argc == 1) {
-        runTests();
-    } else {
-        if (strcmp(argv[1], "-d") == 0) {
-            for (int i = 2; i < argc; ++i)
-                processDev(argv[i]);
-        } else if (strcmp(argv[1], "-n") == 0) {
-            for (int i = 2; i < argc; ++i)
-                processNanite(argv[i]);
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
+            inputPath = argv[i + 1];
+            i++;
+        } else if (strcmp(argv[i], "-r") == 0 && i + 1 < argc) {
+            ratio = float(atof(argv[i + 1]));
+            i++;
+        } else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
+            outputPath = argv[i + 1];
+            i++;
+        } else if (strcmp(argv[i], "-N") == 0 && i + 1 < argc) {
+            naniteImport = argv[i + 1];
+            i++;
+        } else if (strcmp(argv[i], "-X") == 0 && i + 1 < argc) {
+            naniteExport = argv[i + 1];
+            i++;
         } else {
-            for (int i = 1; i < argc; ++i)
-                process(argv[i]);
-
-            runTests();
+            printf("Usage: mesh-simplifier -i <input.obj> [-r <ratio>] [-o <output.obj>] [-X "
+                   "<nanite.bin>] [-N <nanite.bin>]\n");
+            return 1;
         }
     }
+
+    NaniteTree tree;
+
+    if (naniteImport) {
+        tree = import_nanite(naniteImport);
+        if (tree.levels.empty() || tree.source.vertices.empty()) {
+            printf("Failed to import nanite tree from %s\n", naniteImport);
+            return 1;
+        }
+        if (!(ratio > 0.0f && ratio <= 1.0f))
+            ratio = 0.5f;
+        Mesh simplified = simplify_mesh(tree, ratio);
+        if (outputPath) {
+            if (!saveObj(outputPath, simplified))
+                printf("Failed to write output OBJ to %s\n", outputPath);
+        }
+        printf("Simplified from prebuilt Nanite: ratio %.2f => %zu triangles (hash %llu)\n", ratio,
+               simplified.indices.size() / 3, static_cast<unsigned long long>(tree.hash));
+        return 0;
+    }
+
+    if (inputPath) {
+        Mesh mesh;
+        if (!loadMesh(mesh, inputPath)) {
+            printf("Failed to load mesh from %s\n", inputPath);
+            return 1;
+        }
+
+        // Clamp ratio to sensible bounds [0.01, 1.0]
+        if (!(ratio > 0.0f && ratio <= 1.0f))
+            ratio = 0.5f;
+
+        tree            = init_mesh(mesh);
+        Mesh simplified = simplify_mesh(tree, ratio);
+
+        if (naniteExport) {
+            if (export_nanite(tree, naniteExport))
+                printf("Exported Nanite tree to %s (hash %llu)\n", naniteExport,
+                       static_cast<unsigned long long>(tree.hash));
+            else
+                printf("Failed to export Nanite tree to %s\n", naniteExport);
+        }
+
+        if (outputPath) {
+            if (!saveObj(outputPath, simplified))
+                printf("Failed to write output OBJ to %s\n", outputPath);
+        }
+
+        printf(
+            "Simplified using Nanite hierarchy: target ratio %.2f => %zu triangles (hash %llu)\n",
+            ratio, simplified.indices.size() / 3, static_cast<unsigned long long>(tree.hash));
+        return 0;
+    }
+
+    printf("Usage: mesh-simplifier -i <input.obj> [-r <ratio>] [-o <output.obj>] [-X <nanite.bin>] "
+           "[-N <nanite.bin>]\n");
+    return 1;
 }
