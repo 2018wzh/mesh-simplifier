@@ -221,6 +221,34 @@ bool saveObj(const char *path, const Mesh &mesh) {
     return true;
 }
 
+// Remove vertices that are no longer referenced by the index buffer after processing
+static void removeUnusedVertices(Mesh &mesh) {
+    if (mesh.indices.empty() || mesh.vertices.empty())
+        return;
+
+    const unsigned int unused = ~0u;
+
+    std::vector<unsigned int> remap(mesh.vertices.size(), unused);
+    std::vector<Vertex> compact;
+    compact.reserve(mesh.vertices.size());
+
+    for (size_t i = 0; i < mesh.indices.size(); ++i) {
+        unsigned int idx = mesh.indices[i];
+        assert(idx < mesh.vertices.size());
+
+        unsigned int mapped = remap[idx];
+        if (mapped == unused) {
+            mapped     = unsigned(compact.size());
+            remap[idx] = mapped;
+            compact.push_back(mesh.vertices[idx]);
+        }
+
+        mesh.indices[i] = mapped;
+    }
+
+    mesh.vertices.swap(compact);
+}
+
 struct PackedVertex {
     unsigned short px, py, pz;
     unsigned short pw; // padding to 4b boundary
@@ -1616,6 +1644,7 @@ int main(int argc, char **argv) {
         if (!(ratio > 0.0f && ratio <= 1.0f))
             ratio = 0.5f;
         Mesh simplified = simplify_mesh(tree, ratio);
+        removeUnusedVertices(simplified);
         if (outputPath) {
             if (!saveObj(outputPath, simplified))
                 printf("Failed to write output OBJ to %s\n", outputPath);
@@ -1638,6 +1667,7 @@ int main(int argc, char **argv) {
 
         tree            = init_mesh(mesh);
         Mesh simplified = simplify_mesh(tree, ratio);
+        removeUnusedVertices(simplified);
 
         if (naniteExport) {
             if (export_nanite(tree, naniteExport))
