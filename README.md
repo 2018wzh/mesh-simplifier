@@ -4,25 +4,25 @@ A small C++ tool built on top of [meshoptimizer](https://github.com/zeux/meshopt
 
 ## Build
 
-Prerequisites: CMake, a C++17 compiler, and vcpkg (manifest is included).
+Prerequisites: CMake, a C++17 compiler, and vcpkg.
 
-```pwsh
-cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=./vcpkg_installed/vcpkg/scripts/buildsystems/vcpkg.cmake -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release
+```sh
+cmake -B build
+cmake --build build
 ```
 
 ## Usage
 
-The executable is `build/mesh-simplifier.exe`.
+The executable is `build/mesh-simplifier`.
 
 Simplify from an OBJ and export Nanite data:
-```pwsh
-./build/mesh-simplifier.exe -i ./data/wall.obj -r 0.50 -o wall.out.obj -X wall.nanite.bin
+```sh
+./build/mesh-simplifier -i ./data/wall.obj -r 0.50 -o wall.out.obj -X wall.nanite.bin
 ```
 
 Simplify using a precomputed Nanite tree:
-```pwsh
-./build/mesh-simplifier.exe -N wall.nanite.bin -r 0.25 -o wall.out.obj
+```sh
+./build/mesh-simplifier -N wall.nanite.bin -r 0.25 -o wall.out.obj
 ```
 
 Options:
@@ -46,4 +46,4 @@ Options:
 ## Credits
 - [meshoptimizer](https://github.com/zeux/meshoptimizer)
 - [fast_obj](https://github.com/thisistherk/fast_obj)
-- Brian Karis. Nanite: A Deep Dive. 2021
+- [Brian Karis. Nanite: A Deep Dive. 2021](https://www.youtube.com/watch?v=eviSykqSUUw)
