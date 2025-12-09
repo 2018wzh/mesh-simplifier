@@ -15,7 +15,6 @@ add_executable(mesh-simplifier)
 target_sources(mesh-simplifier 
 	PRIVATE 
 		src/main.cpp
-		src/nanite.cpp
 )
 
 # Include directories for the main application
@@ -24,9 +23,6 @@ target_include_directories(mesh-simplifier
 		${CMAKE_CURRENT_SOURCE_DIR}/src
 		${CMAKE_CURRENT_SOURCE_DIR}/lib
 )
-
-find_package(meshoptimizer CONFIG REQUIRED)
-target_link_libraries(mesh-simplifier PRIVATE meshoptimizer::meshoptimizer)
 
 message(STATUS "Project: ${PROJECT_NAME} v${PROJECT_VERSION}")
 message(STATUS "C++ standard: ${CMAKE_CXX_STANDARD}")
