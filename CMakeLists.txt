@@ -16,7 +16,6 @@ target_sources(mesh-simplifier
 	PRIVATE 
 		src/main.cpp
 		src/nanite.cpp
-		src/tests.cpp
 )
 
 # Include directories for the main application
