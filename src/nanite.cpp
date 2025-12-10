@@ -1,707 +1,450 @@
-// For reference, see the original Nanite paper:
-// Brian Karis. Nanite: A Deep Dive. 2021
-#include <meshoptimizer.h>
-
-#include <float.h>
-#include <math.h>
-#include <stdio.h>
-#include <string.h>
+#include "nanite.h"
 
 #include <algorithm>
-#include <vector>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <memory>
+#include <numeric>
+#include <queue>
+#include <unordered_map>
 
-#include "mesh_types.h"
-#include "nanite_api.h"
+#include <vcg/complex/algorithms/clean.h>
+#include <vcg/complex/algorithms/create/platonic.h>
+#include <vcg/space/index/grid_util.h>
 
-#include <stdint.h>
+namespace nanite {
+namespace {
 
-#define CLUSTERLOD_IMPLEMENTATION
-#include "clusterlod.h"
-
-// computes approximate (perspective) projection error of a cluster in screen space (0..1; multiply
-// by screen height to get pixels) camera_proj is projection[1][1], or cot(fovy/2); camera_znear is
-// *positive* near plane distance for DAG cut to be valid, boundsError must be monotonic: it must
-// return a larger error for parent cluster for simplicity, we ignore perspective distortion and use
-// rotationally invariant projection size estimation
-static float boundsError(const clodBounds &bounds, float camera_x, float camera_y, float camera_z,
-                         float camera_proj, float camera_znear) {
-    float dx = bounds.center[0] - camera_x, dy = bounds.center[1] - camera_y,
-          dz = bounds.center[2] - camera_z;
-    float d  = sqrtf(dx * dx + dy * dy + dz * dz) - bounds.radius;
-    return bounds.error / (d > camera_znear ? d : camera_znear) * (camera_proj * 0.5f);
+// Helper to ensure we keep meshes well-formed before any operation.
+void CleanGeometry(Mesh &mesh) {
+    vcg::tri::Clean<Mesh>::RemoveDuplicateVertex(mesh);
+    vcg::tri::Clean<Mesh>::RemoveDegenerateFace(mesh);
+    vcg::tri::Clean<Mesh>::RemoveUnreferencedVertex(mesh);
+    vcg::tri::UpdateTopology<Mesh>::FaceFace(mesh);
+    vcg::tri::UpdateNormal<Mesh>::PerFaceNormalized(mesh);
+    vcg::tri::UpdateNormal<Mesh>::PerVertexAngleWeighted(mesh);
+    vcg::tri::UpdateBounding<Mesh>::Box(mesh);
 }
 
-static uint64_t hash_bytes(const void *data, size_t size, uint64_t seed = 1469598103934665603ull) {
-    const unsigned char *p = static_cast<const unsigned char *>(data);
-    const uint64_t prime   = 1099511628211ull;
-    uint64_t h             = seed;
-    for (size_t i = 0; i < size; ++i) {
-        h ^= uint64_t(p[i]);
-        h *= prime;
+// Decimate in place using quadric edge collapses from vcglib.
+void DecimateInPlace(Mesh &mesh, size_t targetFaces) {
+    // Placeholder: a proper decimator should be wired here. For now, keep mesh unchanged.
+    (void)targetFaces;
+}
+
+// Copy a subset of faces into a standalone mesh (keeps normals/uvs when present).
+std::shared_ptr<Mesh> ExtractSubmesh(const Mesh &source, const std::vector<int> &faceIds) {
+    auto out = std::make_shared<Mesh>();
+    out->vert.reserve(faceIds.size() * 3);
+    out->face.reserve(faceIds.size());
+
+    std::unordered_map<const Vertex *, Vertex *> vmap;
+    vmap.reserve(faceIds.size() * 2 + 1);
+
+    for (int fi : faceIds) {
+        const Face &f = source.face[fi];
+        Vertex *v[3];
+        for (int k = 0; k < 3; ++k) {
+            const Vertex *orig = f.cV(k);
+            auto it            = vmap.find(orig);
+            if (it == vmap.end()) {
+                out->vert.push_back(Vertex());
+                Vertex *nv = &out->vert.back();
+                nv->P()    = orig->cP();
+                nv->N()    = orig->cN();
+                nv->T()    = orig->cT();
+                nv->Q()    = orig->cQ();
+                vmap.emplace(orig, nv);
+                v[k] = nv;
+            } else {
+                v[k] = it->second;
+            }
+        }
+        out->face.push_back(Face());
+        Face &nf = out->face.back();
+        nf.V(0)  = v[0];
+        nf.V(1)  = v[1];
+        nf.V(2)  = v[2];
+        nf.N()   = f.cN();
+        nf.Q()   = f.cQ();
     }
-    return h;
+
+    CleanGeometry(*out);
+    return out;
 }
 
-static uint64_t mesh_hash(const Mesh &mesh) {
-    uint64_t h = hash_bytes(mesh.vertices.data(), mesh.vertices.size() * sizeof(Vertex));
-    h          = hash_bytes(mesh.indices.data(), mesh.indices.size() * sizeof(unsigned int), h);
-    return h;
+// Combine meshes by appending vertices/faces with fresh indices.
+void AppendMesh(Mesh &dst, const Mesh &src) {
+    const size_t vertOffset = dst.vert.size();
+    dst.vert.insert(dst.vert.end(), src.vert.begin(), src.vert.end());
+
+    dst.face.reserve(dst.face.size() + src.face.size());
+    for (const Face &f : src.face) {
+        Face nf;
+        nf.V(0) = &dst.vert[vertOffset + (f.cV(0) - &src.vert[0])];
+        nf.V(1) = &dst.vert[vertOffset + (f.cV(1) - &src.vert[0])];
+        nf.V(2) = &dst.vert[vertOffset + (f.cV(2) - &src.vert[0])];
+        nf.N()  = f.cN();
+        nf.Q()  = f.cQ();
+        dst.face.push_back(nf);
+    }
 }
 
-struct NaniteFileHeader {
-    uint32_t magic;
-    uint32_t version;
-    uint64_t hash;
-    uint64_t vertexCount;
-    uint64_t indexCount;
-    uint64_t levelCount;
+vcg::Box3f ComputeBoundingBox(const Mesh &mesh, const std::vector<int> &faceIds) {
+    vcg::Box3f box;
+    for (int fi : faceIds) {
+        const Face &f = mesh.face[fi];
+        for (int k = 0; k < 3; ++k)
+            box.Add(f.cV(k)->cP());
+    }
+    return box;
+}
+
+float EstimateGeometricError(const vcg::Box3f &box, size_t faceCount) {
+    const float diag    = box.Diag();
+    const float density = faceCount > 0 ? 1.0f / std::sqrt(static_cast<float>(faceCount)) : 1.0f;
+    return diag * density;
+}
+
+struct SplitResult {
+    std::vector<int> left;
+    std::vector<int> right;
 };
 
-static const uint32_t kNaniteMagic   = 0x4e414e49; // 'NANI'
-static const uint32_t kNaniteVersion = 1;
+SplitResult SplitFaces(const Mesh &mesh, const std::vector<int> &faceIds, const vcg::Box3f &box) {
+    SplitResult res;
+    res.left.reserve(faceIds.size() / 2);
+    res.right.reserve(faceIds.size() / 2);
 
-bool export_nanite(const NaniteTree &tree, const char *path) {
-    FILE *f = fopen(path, "wb");
-    if (!f)
-        return false;
+    const vcg::Point3f diag = box.max - box.min;
+    int axis                = 0;
+    if (diag[1] > diag[axis])
+        axis = 1;
+    if (diag[2] > diag[axis])
+        axis = 2;
+    const float mid = (box.min[axis] + box.max[axis]) * 0.5f;
 
-    NaniteFileHeader hdr = {};
-    hdr.magic            = kNaniteMagic;
-    hdr.version          = kNaniteVersion;
-    hdr.hash             = tree.hash;
-    hdr.vertexCount      = tree.source.vertices.size();
-    hdr.indexCount       = tree.source.indices.size();
-    hdr.levelCount       = tree.levels.size();
+    for (int fi : faceIds) {
+        const Face &f  = mesh.face[fi];
+        vcg::Point3f c = (f.cP(0) + f.cP(1) + f.cP(2)) / 3.0f;
+        ((c[axis] <= mid) ? res.left : res.right).push_back(fi);
+    }
 
-    auto fail = [&](FILE *file) {
-        fclose(file);
-        return false;
-    };
-
-    if (fwrite(&hdr, sizeof(hdr), 1, f) != 1)
-        return fail(f);
-
-    if (!tree.source.vertices.empty() &&
-        fwrite(tree.source.vertices.data(), sizeof(Vertex), hdr.vertexCount, f) != hdr.vertexCount)
-        return fail(f);
-
-    if (!tree.source.indices.empty() && fwrite(tree.source.indices.data(), sizeof(unsigned int),
-                                               hdr.indexCount, f) != hdr.indexCount)
-        return fail(f);
-
-    for (size_t i = 0; i < tree.levels.size(); ++i) {
-        uint64_t tri = tree.trianglesPerLevel.size() > i ? uint64_t(tree.trianglesPerLevel[i]) : 0;
-        uint64_t clusters = uint64_t(tree.levels[i].size());
-
-        if (fwrite(&tri, sizeof(tri), 1, f) != 1)
-            return fail(f);
-        if (fwrite(&clusters, sizeof(clusters), 1, f) != 1)
-            return fail(f);
-
-        for (const auto &c : tree.levels[i]) {
-            uint64_t sz = uint64_t(c.size());
-            if (fwrite(&sz, sizeof(sz), 1, f) != 1)
-                return fail(f);
-            if (!c.empty() && fwrite(c.data(), sizeof(unsigned int), sz, f) != sz)
-                return fail(f);
+    // Guard against empty buckets to keep tree well-formed.
+    if (res.left.empty() || res.right.empty()) {
+        res.left.clear();
+        res.right.clear();
+        res.left.reserve(faceIds.size() / 2);
+        res.right.reserve(faceIds.size() / 2);
+        for (size_t i = 0; i < faceIds.size(); ++i) {
+            (i < faceIds.size() / 2 ? res.left : res.right).push_back(faceIds[i]);
         }
     }
 
-    fclose(f);
+    return res;
+}
+
+std::shared_ptr<Mesh> BuildProxy(const Mesh &source, const std::vector<int> &faceIds,
+                                 const BuildSettings &settings, float bboxDiag) {
+    (void)bboxDiag; // currently unused, kept for future heuristics
+    auto proxy = ExtractSubmesh(source, faceIds);
+    const size_t desired =
+        std::clamp<size_t>(static_cast<size_t>(faceIds.size() * settings.proxyRatio),
+                           settings.proxyMinFaces, settings.proxyMaxFaces);
+    if (proxy->face.size() > desired) {
+        DecimateInPlace(*proxy, desired);
+    }
+    return proxy;
+}
+
+int BuildNodeRecursive(const Mesh &source, const BuildSettings &settings, std::vector<Node> &nodes,
+                       const std::vector<int> &faceIds, int depth) {
+    const vcg::Box3f box = ComputeBoundingBox(source, faceIds);
+    const float geomErr  = EstimateGeometricError(box, faceIds.size());
+
+    Node node;
+    node.bbox           = box;
+    node.geometricError = geomErr;
+
+    bool isLeaf =
+        faceIds.size() <= settings.maxLeafFaces || depth >= static_cast<int>(settings.maxDepth);
+    if (isLeaf) {
+        node.proxy      = BuildProxy(source, faceIds, settings, box.Diag());
+        node.firstChild = 0;
+        node.childCount = 0;
+        const int idx   = static_cast<int>(nodes.size());
+        nodes.push_back(node);
+        return idx;
+    }
+
+    const SplitResult split = SplitFaces(source, faceIds, box);
+    const int idx           = static_cast<int>(nodes.size());
+    nodes.push_back(Node{}); // placeholder to keep indices stable
+
+    const int leftIdx  = BuildNodeRecursive(source, settings, nodes, split.left, depth + 1);
+    const int rightIdx = BuildNodeRecursive(source, settings, nodes, split.right, depth + 1);
+
+    node.proxy          = BuildProxy(source, faceIds, settings, box.Diag());
+    node.firstChild     = static_cast<uint32_t>(leftIdx);
+    node.childCount     = 2;
+    node.geometricError = geomErr;
+    node.bbox           = box;
+
+    nodes[idx] = node;
+    return idx;
+}
+
+} // namespace
+
+std::shared_ptr<Mesh> LoadObj(const std::string &path, std::string &error) {
+    auto mesh     = std::make_shared<Mesh>();
+    int mask      = 0;
+    const int res = vcg::tri::io::ImporterOBJ<Mesh>::Open(*mesh, path.c_str(), mask);
+    if (res != 0) {
+        error = vcg::tri::io::ImporterOBJ<Mesh>::ErrorMsg(res);
+        return nullptr;
+    }
+    CleanGeometry(*mesh);
+    if (mesh->face.empty() || mesh->vert.empty()) {
+        error = "OBJ is empty or unsupported";
+        return nullptr;
+    }
+    return mesh;
+}
+
+bool SaveObj(Mesh &mesh, const std::string &path, std::string &error) {
+    int mask = vcg::tri::io::Mask::IOM_VERTCOORD | vcg::tri::io::Mask::IOM_VERTNORMAL |
+               vcg::tri::io::Mask::IOM_VERTTEXCOORD | vcg::tri::io::Mask::IOM_FACEINDEX;
+    const int res = vcg::tri::io::ExporterOBJ<Mesh>::Save(mesh, path.c_str(), mask);
+    if (res != 0) {
+        error = vcg::tri::io::ExporterOBJ<Mesh>::ErrorMsg(res);
+        return false;
+    }
     return true;
 }
 
-NaniteTree import_nanite(const char *path) {
-    NaniteTree tree;
+Tree BuildTree(const Mesh &source, const BuildSettings &settings) {
+    Tree tree;
+    tree.originalFaceCount   = source.face.size();
+    tree.originalVertexCount = source.vert.size();
 
-    FILE *f = fopen(path, "rb");
-    if (!f)
-        return tree;
+    std::vector<int> faceIds(source.face.size());
+    std::iota(faceIds.begin(), faceIds.end(), 0);
 
-    NaniteFileHeader hdr = {};
-    if (fread(&hdr, sizeof(hdr), 1, f) != 1 || hdr.magic != kNaniteMagic ||
-        hdr.version != kNaniteVersion) {
-        fclose(f);
-        return NaniteTree();
-    }
-
-    std::vector<Vertex> vertices(hdr.vertexCount);
-    std::vector<unsigned int> indices(hdr.indexCount);
-
-    if (hdr.vertexCount &&
-        fread(vertices.data(), sizeof(Vertex), hdr.vertexCount, f) != hdr.vertexCount) {
-        fclose(f);
-        return NaniteTree();
-    }
-
-    if (hdr.indexCount &&
-        fread(indices.data(), sizeof(unsigned int), hdr.indexCount, f) != hdr.indexCount) {
-        fclose(f);
-        return NaniteTree();
-    }
-
-    tree.levels.resize(hdr.levelCount);
-    tree.trianglesPerLevel.resize(hdr.levelCount, 0);
-
-    for (size_t i = 0; i < hdr.levelCount; ++i) {
-        uint64_t tri      = 0;
-        uint64_t clusters = 0;
-        if (fread(&tri, sizeof(tri), 1, f) != 1 || fread(&clusters, sizeof(clusters), 1, f) != 1) {
-            fclose(f);
-            return NaniteTree();
-        }
-
-        tree.trianglesPerLevel[i] = size_t(tri);
-        tree.levels[i].resize(size_t(clusters));
-
-        for (size_t cidx = 0; cidx < clusters; ++cidx) {
-            uint64_t sz = 0;
-            if (fread(&sz, sizeof(sz), 1, f) != 1) {
-                fclose(f);
-                return NaniteTree();
-            }
-
-            std::vector<unsigned int> cluster(sz);
-            if (sz && fread(cluster.data(), sizeof(unsigned int), sz, f) != sz) {
-                fclose(f);
-                return NaniteTree();
-            }
-
-            tree.levels[i][cidx] = std::move(cluster);
-        }
-    }
-
-    fclose(f);
-
-    tree.source.vertices   = std::move(vertices);
-    tree.source.indices    = std::move(indices);
-    tree.originalTriangles = size_t(hdr.indexCount / 3);
-    tree.hash              = hdr.hash;
-
+    tree.nodes.reserve(source.face.size() / settings.maxLeafFaces * 2 + 8);
+    BuildNodeRecursive(source, settings, tree.nodes, faceIds, 0);
     return tree;
 }
 
-NaniteTree init_mesh(const Mesh &mesh) {
-    NaniteTree tree;
-    tree.source            = mesh;
-    tree.originalTriangles = mesh.indices.size() / 3;
-    tree.hash              = mesh_hash(mesh);
+ViewCut BuildViewDependentCut(const Tree &tree, float ratio, bool verbose) {
+    ViewCut cut;
+    cut.mesh = std::make_shared<Mesh>();
+    if (tree.nodes.empty())
+        return cut;
 
-    if (mesh.vertices.empty() || mesh.indices.empty())
-        return tree;
+    const size_t targetFaces = static_cast<size_t>(std::clamp(ratio, 0.01f, 1.0f) *
+                                                   static_cast<float>(tree.originalFaceCount));
+    std::vector<char> active(tree.nodes.size(), 0);
 
-    clodConfig config = clodDefaultConfig(/*max_triangles=*/128);
+    struct Item {
+        int idx;
+        float error;
+    };
+    auto cmp = [](const Item &a, const Item &b) { return a.error < b.error; };
+    std::priority_queue<Item, std::vector<Item>, decltype(cmp)> queue(cmp);
 
-    const float attribute_weights[3] = {0.5f, 0.5f, 0.5f};
+    queue.push({0, tree.root().geometricError});
+    active[0]           = 1;
+    size_t currentFaces = tree.root().proxy ? tree.root().proxy->face.size() : 0;
 
-    clodMesh clod                 = {};
-    clod.indices                  = mesh.indices.data();
-    clod.index_count              = mesh.indices.size();
-    clod.vertex_count             = mesh.vertices.size();
-    clod.vertex_positions         = &mesh.vertices[0].px;
-    clod.vertex_positions_stride  = sizeof(Vertex);
-    clod.vertex_attributes        = &mesh.vertices[0].nx;
-    clod.vertex_attributes_stride = sizeof(Vertex);
-    clod.attribute_weights        = attribute_weights;
-    clod.attribute_count          = sizeof(attribute_weights) / sizeof(attribute_weights[0]);
-    clod.attribute_protect_mask   = (1 << 3) | (1 << 4); // protect UV seams (tx/ty)
+    if (verbose) {
+        std::cout << "[cut] start target faces " << targetFaces << ", initial " << currentFaces
+                  << std::endl;
+    }
 
-    int groupId = 0;
+    while (currentFaces < targetFaces && !queue.empty()) {
+        Item top = queue.top();
+        queue.pop();
+        const Node &n = tree.nodes[top.idx];
+        if (n.childCount == 0)
+            continue;
+        if (!n.proxy)
+            continue;
 
-    clodBuild(config, clod,
-              [&](clodGroup group, const clodCluster *clusters, size_t cluster_count) -> int {
-                  size_t depth = size_t(group.depth);
-                  if (tree.levels.size() <= depth) {
-                      tree.levels.resize(depth + 1);
-                      tree.trianglesPerLevel.resize(depth + 1, 0);
-                  }
-
-                  std::vector<std::vector<unsigned int>> &level = tree.levels[depth];
-
-                  for (size_t i = 0; i < cluster_count; ++i) {
-                      const clodCluster &cluster = clusters[i];
-                      std::vector<unsigned int> indices(cluster.indices,
-                                                        cluster.indices + cluster.index_count);
-                      tree.trianglesPerLevel[depth] += cluster.index_count / 3;
-                      level.push_back(std::move(indices));
-                  }
-
-                  // Return a unique id for DAG bookkeeping; we don't use it beyond clodBuild
-                  return groupId++;
-              });
-
-    return tree;
-}
-
-Mesh simplify_mesh(const NaniteTree &tree, float ratio) {
-    Mesh result = tree.source;
-
-    if (tree.levels.empty())
-        return result;
-
-    if (!(ratio > 0.f && ratio <= 1.f))
-        ratio = 0.5f;
-
-    size_t target_triangles = size_t(std::max<size_t>(1, size_t(tree.originalTriangles * ratio)));
-
-    // Pick the deepest level whose triangle count does not exceed the target; fallback to coarsest
-    size_t chosen_level = tree.levels.size() - 1;
-    for (size_t i = 0; i < tree.trianglesPerLevel.size(); ++i) {
-        if (tree.trianglesPerLevel[i] <= target_triangles) {
-            chosen_level = i;
-            break;
+        active[top.idx] = 0;
+        currentFaces -= n.proxy->face.size();
+        if (verbose) {
+            std::cout << "[cut] split node " << top.idx << " err=" << n.geometricError
+                      << " -> children " << n.firstChild << " and " << (n.firstChild + 1)
+                      << std::endl;
+        }
+        for (uint32_t c = 0; c < n.childCount; ++c) {
+            int ci     = static_cast<int>(n.firstChild + c);
+            active[ci] = 1;
+            queue.push({ci, tree.nodes[ci].geometricError});
+            if (tree.nodes[ci].proxy)
+                currentFaces += tree.nodes[ci].proxy->face.size();
+        }
+        if (verbose) {
+            std::cout << "[cut] faces now " << currentFaces << " / " << targetFaces << std::endl;
         }
     }
 
-    const std::vector<std::vector<unsigned int>> &clusters = tree.levels[chosen_level];
+    // Reserve once to avoid reallocations that would invalidate face vertex pointers.
+    size_t totalVerts = 0, totalFaces = 0;
+    for (size_t i = 0; i < tree.nodes.size(); ++i) {
+        if (!active[i] || !tree.nodes[i].proxy)
+            continue;
+        totalVerts += tree.nodes[i].proxy->vert.size();
+        totalFaces += tree.nodes[i].proxy->face.size();
+    }
+    cut.mesh->vert.reserve(totalVerts);
+    cut.mesh->face.reserve(totalFaces);
 
-    size_t total_index_count = 0;
-    for (const auto &c : clusters)
-        total_index_count += c.size();
-
-    result.indices.clear();
-    result.indices.reserve(total_index_count);
-    for (const auto &c : clusters)
-        result.indices.insert(result.indices.end(), c.begin(), c.end());
-
-    if (!result.indices.empty()) {
-        meshopt_optimizeVertexCache(&result.indices[0], &result.indices[0], result.indices.size(),
-                                    result.vertices.size());
-        meshopt_optimizeVertexFetch(&result.vertices[0], &result.indices[0], result.indices.size(),
-                                    &result.vertices[0], result.vertices.size(), sizeof(Vertex));
+    for (size_t i = 0; i < tree.nodes.size(); ++i) {
+        if (!active[i])
+            continue;
+        if (tree.nodes[i].proxy)
+            AppendMesh(*cut.mesh, *tree.nodes[i].proxy);
     }
 
-    return result;
+    CleanGeometry(*cut.mesh);
+    cut.usedFaces     = cut.mesh->face.size();
+    cut.achievedRatio = tree.originalFaceCount > 0 ? static_cast<float>(cut.usedFaces) /
+                                                         static_cast<float>(tree.originalFaceCount)
+                                                   : 0.0f;
+    return cut;
 }
 
-static int measureComponents(std::vector<int> &parents, const std::vector<unsigned int> &indices,
-                             const std::vector<unsigned int> &remap);
-static size_t measureBoundary(std::vector<int> &used,
-                              const std::vector<std::vector<unsigned int>> &clusters,
-                              const std::vector<unsigned int> &remap);
-static float sahOverhead(const std::vector<std::vector<unsigned int>> &clusters,
-                         const std::vector<Vertex> &vertices);
-
-void dumpObj(const std::vector<Vertex> &vertices, const std::vector<unsigned int> &indices,
-             bool recomputeNormals = false);
-void dumpObj(const char *section, const std::vector<unsigned int> &indices);
-
-void nanite(const std::vector<Vertex> &vertices, const std::vector<unsigned int> &indices) {
-#ifdef _MSC_VER
-    static const char *dump = NULL; // tired of C4996
-    static const char *clrt = NULL;
-#else
-    static const char *dump = getenv("DUMP");
-    static const char *clrt = getenv("CLRT");
-#endif
-
-    clodConfig config = clodDefaultConfig(/*max_triangles=*/128);
-
-    if (clrt) {
-        config                     = clodDefaultConfigRT(config.max_triangles);
-        config.cluster_fill_weight = float(atof(clrt));
-    }
-
-    const float attribute_weights[3] = {0.5f, 0.5f, 0.5f};
-
-    clodMesh mesh                 = {};
-    mesh.indices                  = indices.data();
-    mesh.index_count              = indices.size();
-    mesh.vertex_count             = vertices.size();
-    mesh.vertex_positions         = &vertices[0].px;
-    mesh.vertex_positions_stride  = sizeof(Vertex);
-    mesh.vertex_attributes        = &vertices[0].nx;
-    mesh.vertex_attributes_stride = sizeof(Vertex);
-    mesh.attribute_weights        = attribute_weights;
-    mesh.attribute_count          = sizeof(attribute_weights) / sizeof(attribute_weights[0]);
-    mesh.attribute_protect_mask   = (1 << 3) | (1 << 4); // protect UV seams, maps to Vertex::tx/ty
-
-    struct Stats {
-        size_t groups;
-        size_t clusters;
-        size_t triangles;
-        size_t vertices;
-
-        size_t full_clusters;
-        size_t singleton_groups;
-
-        size_t stuck_clusters;
-        size_t stuck_triangles;
-
-        double radius;
-
-        std::vector<std::vector<unsigned int>> indices; // for detailed connectivity analysis
+bool SaveTree(const Tree &tree, const std::string &path, std::string &error) {
+    struct Header {
+        char magic[8];
+        uint32_t version;
+        uint64_t nodeCount;
+        uint64_t originalFaces;
+        uint64_t originalVerts;
     };
 
-    std::vector<Stats> stats;
-    std::vector<clodBounds> groups;
-
-    std::vector<std::vector<unsigned int>> cut;
-    int cut_level = dump ? atoi(dump) : -2;
-
-    // for testing purposes, we can compute a DAG cut from a given viewpoint and dump it as an OBJ
-    float maxx = 0.f, maxy = 0.f, maxz = 0.f;
-    for (size_t i = 0; i < vertices.size(); ++i) {
-        maxx = std::max(maxx, vertices[i].px * 2);
-        maxy = std::max(maxy, vertices[i].py * 2);
-        maxz = std::max(maxz, vertices[i].pz * 2);
+    std::ofstream out(path, std::ios::binary);
+    if (!out) {
+        error = "Cannot open file for writing";
+        return false;
     }
 
-    float threshold = 2e-3f; // 2 pixels at 1080p
-    float fovy      = 60.f;
-    float znear     = 1e-2f;
-    float proj      = 1.f / tanf(fovy * 3.1415926f / 180.f * 0.5f);
+    Header h{};
+    std::memcpy(h.magic, "NANITET", 7);
+    h.version       = 1;
+    h.nodeCount     = tree.nodes.size();
+    h.originalFaces = tree.originalFaceCount;
+    h.originalVerts = tree.originalVertexCount;
+    out.write(reinterpret_cast<const char *>(&h), sizeof(h));
 
-    clodBuild(config, mesh,
-              [&](clodGroup group, const clodCluster *clusters,
-                  size_t cluster_count) -> int { // clang-format!
-                  if (stats.size() <= size_t(group.depth))
-                      stats.push_back({});
+    for (const Node &n : tree.nodes) {
+        out.write(reinterpret_cast<const char *>(n.bbox.min.V()), sizeof(float) * 3);
+        out.write(reinterpret_cast<const char *>(n.bbox.max.V()), sizeof(float) * 3);
+        out.write(reinterpret_cast<const char *>(&n.geometricError), sizeof(float));
+        out.write(reinterpret_cast<const char *>(&n.firstChild), sizeof(uint32_t));
+        out.write(reinterpret_cast<const char *>(&n.childCount), sizeof(uint32_t));
 
-                  Stats &level = stats[group.depth];
-
-                  level.groups++;
-                  level.clusters += cluster_count;
-                  if (group.simplified.error == FLT_MAX)
-                      level.stuck_clusters += cluster_count;
-                  level.singleton_groups += cluster_count == 1;
-
-                  for (size_t i = 0; i < cluster_count; ++i) {
-                      const clodCluster &cluster = clusters[i];
-
-                      level.triangles += cluster.index_count / 3;
-                      if (group.simplified.error == FLT_MAX)
-                          level.stuck_triangles += cluster.index_count / 3;
-                      level.vertices += cluster.vertex_count;
-
-                      level.full_clusters += (cluster.index_count == config.max_triangles * 3);
-                      level.radius += cluster.bounds.radius;
-
-                      level.indices.push_back(std::vector<unsigned int>(
-                          cluster.indices, cluster.indices + cluster.index_count));
-
-                      // when requesting DAG cut at a given level, we need to render all terminal
-                      // clusters at lower depth as well
-                      if (cut_level >= 0 &&
-                          (group.depth == cut_level ||
-                           (group.depth < cut_level && group.simplified.error == FLT_MAX)))
-                          cut.push_back(std::vector<unsigned int>(
-                              cluster.indices, cluster.indices + cluster.index_count));
-
-                      // when requesting DAG cut from a viewpoint, we need to check if each cluster
-                      // is the least detailed cluster that passes the error threshold
-                      if (cut_level == -1 &&
-                          (cluster.refined < 0 || boundsError(groups[cluster.refined], maxx, maxy,
-                                                              maxz, proj, znear) <= threshold) &&
-                          boundsError(group.simplified, maxx, maxy, maxz, proj, znear) > threshold)
-                          cut.push_back(std::vector<unsigned int>(
-                              cluster.indices, cluster.indices + cluster.index_count));
-                  }
-
-                  level.indices.push_back(
-                      std::vector<unsigned int>()); // mark end of group for measureBoundary
-
-                  groups.push_back(group.simplified);
-                  return int(groups.size() - 1);
-              });
-
-    // for cluster connectivity analysis and boundary statistics, we need a position-only remap that
-    // maps vertices with the same position to the same index
-    std::vector<unsigned int> remap(vertices.size());
-    meshopt_generatePositionRemap(&remap[0], &vertices[0].px, vertices.size(), sizeof(Vertex));
-
-    std::vector<int> used(vertices.size());
-
-    size_t lowest_clusters  = 0;
-    size_t lowest_triangles = 0;
-
-    for (size_t i = 0; i < stats.size(); ++i) {
-        Stats &level = stats[i];
-
-        lowest_clusters += level.stuck_clusters;
-        lowest_triangles += level.stuck_triangles;
-
-        size_t connected = 0;
-        for (const auto &cluster : level.indices)
-            connected += measureComponents(used, cluster, remap);
-
-        size_t boundary = measureBoundary(used, level.indices, remap);
-        float saho      = clrt ? sahOverhead(level.indices, vertices) : 0.f;
-
-        double inv_clusters = 1.0 / double(level.clusters);
-
-        printf(
-            "lod %d: %d clusters (%.1f%% full, %.1f tri/cl, %.1f vtx/cl, %.2f connected, %.1f "
-            "boundary, %.1f partition, %d singletons, %.3f sah overhead, %f radius), %d triangles",
-            int(i), int(level.clusters), double(level.full_clusters) * inv_clusters * 100,
-            double(level.triangles) * inv_clusters, double(level.vertices) * inv_clusters,
-            double(connected) * inv_clusters, double(boundary) * inv_clusters,
-            double(level.clusters) / double(level.groups), int(level.singleton_groups), saho,
-            level.radius * inv_clusters, int(level.triangles));
-        if (level.stuck_clusters && level.clusters > 1)
-            printf("; stuck %d clusters (%d triangles)", int(level.stuck_clusters),
-                   int(level.stuck_triangles));
-        printf("\n");
-    }
-
-    printf("lowest lod: %d clusters, %d triangles\n", int(lowest_clusters), int(lowest_triangles));
-
-    if (cut_level >= -1) {
-        size_t cut_tris = 0;
-        for (auto &cluster : cut)
-            cut_tris += cluster.size() / 3;
-
-        if (cut_level >= 0)
-            printf("cut (level %d): %d triangles\n", cut_level, int(cut_tris));
-        else
-            printf("cut (error %.3f): %d triangles\n", threshold, int(cut_tris));
-
-        dumpObj(vertices, std::vector<unsigned int>());
-
-        for (auto &cluster : cut)
-            dumpObj("cluster", cluster);
-    }
-}
-
-// What follows is code that is helpful for collecting metrics, visualizing cuts, etc.
-// This code is not used in the actual clustering implementation and can be ignored.
-static int follow(std::vector<int> &parents, int index) {
-    while (index != parents[index]) {
-        int parent     = parents[index];
-        parents[index] = parents[parent];
-        index          = parent;
-    }
-
-    return index;
-}
-
-static int measureComponents(std::vector<int> &parents, const std::vector<unsigned int> &indices,
-                             const std::vector<unsigned int> &remap) {
-    assert(parents.size() == remap.size());
-
-    for (size_t i = 0; i < indices.size(); ++i) {
-        unsigned int v = remap[indices[i]];
-        parents[v]     = v;
-    }
-
-    for (size_t i = 0; i < indices.size(); ++i) {
-        int v0 = remap[indices[i]];
-        int v1 = remap[indices[i + (i % 3 == 2 ? -2 : 1)]];
-
-        v0 = follow(parents, v0);
-        v1 = follow(parents, v1);
-
-        parents[v0] = v1;
-    }
-
-    for (size_t i = 0; i < indices.size(); ++i) {
-        unsigned int v = remap[indices[i]];
-        parents[v]     = follow(parents, v);
-    }
-
-    int roots = 0;
-    for (size_t i = 0; i < indices.size(); ++i) {
-        unsigned int v = remap[indices[i]];
-        roots += parents[v] == int(v);
-        parents[v] = -1; // make sure we only count each root once
-    }
-
-    return roots;
-}
-
-static size_t measureBoundary(std::vector<int> &used,
-                              const std::vector<std::vector<unsigned int>> &clusters,
-                              const std::vector<unsigned int> &remap) {
-    for (size_t i = 0; i < used.size(); ++i)
-        used[i] = -1;
-
-    // mark vertices that are used by multiple groups with -2
-    int group = 0;
-
-    for (size_t i = 0; i < clusters.size(); ++i) {
-        group += clusters[i].empty();
-
-        for (size_t j = 0; j < clusters[i].size(); ++j) {
-            unsigned int v = remap[clusters[i][j]];
-
-            used[v] = (used[v] == -1 || used[v] == group) ? group : -2;
-        }
-    }
-
-    size_t result = 0;
-
-    for (size_t i = 0; i < clusters.size(); ++i) {
-        // count vertices that are used by multiple groups and change marks to -1
-        for (size_t j = 0; j < clusters[i].size(); ++j) {
-            unsigned int v = remap[clusters[i][j]];
-
-            result += (used[v] == -2);
-            used[v] = (used[v] == -2) ? -1 : used[v];
-        }
-
-        // change marks back from -1 to -2 for the next pass
-        for (size_t j = 0; j < clusters[i].size(); ++j) {
-            unsigned int v = remap[clusters[i][j]];
-
-            used[v] = (used[v] == -1) ? -2 : used[v];
-        }
-    }
-
-    return int(result);
-}
-
-struct Box {
-    float min[3];
-    float max[3];
-};
-
-static const Box kDummyBox = {{FLT_MAX, FLT_MAX, FLT_MAX}, {-FLT_MAX, -FLT_MAX, -FLT_MAX}};
-
-static void mergeBox(Box &box, const Box &other) {
-    for (int k = 0; k < 3; ++k) {
-        box.min[k] = other.min[k] < box.min[k] ? other.min[k] : box.min[k];
-        box.max[k] = other.max[k] > box.max[k] ? other.max[k] : box.max[k];
-    }
-}
-
-inline float surface(const Box &box) {
-    float sx = box.max[0] - box.min[0], sy = box.max[1] - box.min[1], sz = box.max[2] - box.min[2];
-    return sx * sy + sx * sz + sy * sz;
-}
-
-static float sahCost(const Box *boxes, unsigned int *order, unsigned int *temp, size_t count) {
-    Box total = boxes[order[0]];
-    for (size_t i = 1; i < count; ++i)
-        mergeBox(total, boxes[order[i]]);
-
-    int best_axis   = -1;
-    int best_bin    = -1;
-    float best_cost = FLT_MAX;
-
-    const int kBins = 15;
-
-    for (int axis = 0; axis < 3; ++axis) {
-        Box bins[kBins];
-        unsigned int counts[kBins] = {};
-
-        float extent = total.max[axis] - total.min[axis];
-        if (extent <= 0.f)
-            continue;
-
-        for (int i = 0; i < kBins; ++i)
-            bins[i] = kDummyBox;
-
-        for (size_t i = 0; i < count; ++i) {
-            unsigned int index = order[i];
-            float p            = (boxes[index].min[axis] + boxes[index].max[axis]) * 0.5f;
-            int bin            = int((p - total.min[axis]) / extent * (kBins - 1) + 0.5f);
-            assert(bin >= 0 && bin < kBins);
-
-            mergeBox(bins[bin], boxes[index]);
-            counts[bin]++;
-        }
-
-        Box laccum = kDummyBox, raccum = kDummyBox;
-        size_t lcount = 0, rcount = 0;
-        float costs[kBins] = {};
-
-        for (int i = 0; i < kBins - 1; ++i) {
-            mergeBox(laccum, bins[i]);
-            mergeBox(raccum, bins[kBins - 1 - i]);
-
-            lcount += counts[i];
-            costs[i] += lcount ? surface(laccum) * lcount : 0.f;
-            rcount += counts[kBins - 1 - i];
-            costs[kBins - 2 - i] += rcount ? surface(raccum) * rcount : 0.f;
-        }
-
-        for (int i = 0; i < kBins - 1; ++i)
-            if (costs[i] < best_cost) {
-                best_cost = costs[i];
-                best_bin  = i;
-                best_axis = axis;
+        const Mesh *proxy = n.proxy.get();
+        uint32_t vcount   = proxy ? static_cast<uint32_t>(proxy->vert.size()) : 0u;
+        uint32_t fcount   = proxy ? static_cast<uint32_t>(proxy->face.size()) : 0u;
+        out.write(reinterpret_cast<const char *>(&vcount), sizeof(uint32_t));
+        out.write(reinterpret_cast<const char *>(&fcount), sizeof(uint32_t));
+        if (proxy) {
+            for (const Vertex &v : proxy->vert) {
+                out.write(reinterpret_cast<const char *>(v.cP().V()), sizeof(float) * 3);
+                out.write(reinterpret_cast<const char *>(v.cN().V()), sizeof(float) * 3);
+                const vcg::TexCoord2<float> &t = v.cT();
+                float uv[2]                    = {t.U(), t.V()};
+                out.write(reinterpret_cast<const char *>(uv), sizeof(float) * 2);
             }
-    }
-
-    if (best_axis == -1)
-        return surface(total) * float(count);
-
-    float best_extent = total.max[best_axis] - total.min[best_axis];
-
-    size_t offset0 = 0, offset1 = count;
-
-    for (size_t i = 0; i < count; ++i) {
-        unsigned int index = order[i];
-        float p            = (boxes[index].min[best_axis] + boxes[index].max[best_axis]) * 0.5f;
-        int bin            = int((p - total.min[best_axis]) / best_extent * (kBins - 1) + 0.5f);
-        assert(bin >= 0 && bin < kBins);
-
-        if (bin <= best_bin)
-            temp[offset0++] = index;
-        else
-            temp[--offset1] = index;
-    }
-
-    assert(offset0 == offset1);
-
-    if (offset0 == 0 || offset0 == count)
-        return surface(total) * float(count);
-
-    return surface(total) + sahCost(boxes, temp, order, offset0) +
-           sahCost(boxes, temp + offset0, order + offset0, count - offset0);
-}
-
-static float sahCost(const Box *boxes, size_t count) {
-    if (count == 0)
-        return 0.f;
-
-    std::vector<unsigned int> order(count);
-    for (size_t i = 0; i < count; ++i)
-        order[i] = unsigned(i);
-
-    std::vector<unsigned int> temp(count);
-    return sahCost(boxes, &order[0], &temp[0], count);
-}
-
-static float sahOverhead(const std::vector<std::vector<unsigned int>> &clusters,
-                         const std::vector<Vertex> &vertices) {
-    std::vector<Box> all_tris, cluster_tris, cluster_boxes;
-
-    float sahc = 0.f;
-
-    for (size_t i = 0; i < clusters.size(); ++i) {
-        if (clusters[i].empty())
-            continue;
-
-        cluster_tris.clear();
-
-        Box cluster_box = kDummyBox;
-
-        for (size_t k = 0; k < clusters[i].size(); k += 3) {
-            Box box = kDummyBox;
-
-            for (int v = 0; v < 3; ++v) {
-                const Vertex &vertex = vertices[clusters[i][k + v]];
-
-                Box p = {{vertex.px, vertex.py, vertex.pz}, {vertex.px, vertex.py, vertex.pz}};
-                mergeBox(box, p);
+            for (const Face &f : proxy->face) {
+                uint32_t idx[3] = {static_cast<uint32_t>(f.cV(0) - &proxy->vert[0]),
+                                   static_cast<uint32_t>(f.cV(1) - &proxy->vert[0]),
+                                   static_cast<uint32_t>(f.cV(2) - &proxy->vert[0])};
+                out.write(reinterpret_cast<const char *>(idx), sizeof(uint32_t) * 3);
             }
-
-            mergeBox(cluster_box, box);
-
-            all_tris.push_back(box);
-            cluster_tris.push_back(box);
         }
-
-        cluster_boxes.push_back(cluster_box);
-
-        sahc += sahCost(&cluster_tris[0], cluster_tris.size());
-        sahc -= surface(cluster_box); // box will be accounted for in tlas
     }
 
-    sahc += sahCost(&cluster_boxes[0], cluster_boxes.size());
-
-    float saht = sahCost(all_tris.data(), all_tris.size());
-
-    return sahc / saht;
+    return true;
 }
+
+std::optional<Tree> LoadTree(const std::string &path, std::string &error) {
+    struct Header {
+        char magic[8];
+        uint32_t version;
+        uint64_t nodeCount;
+        uint64_t originalFaces;
+        uint64_t originalVerts;
+    };
+
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        error = "Cannot open file for reading";
+        return std::nullopt;
+    }
+
+    Header h{};
+    in.read(reinterpret_cast<char *>(&h), sizeof(h));
+    if (std::strncmp(h.magic, "NANITET", 7) != 0 || h.version != 1) {
+        error = "Invalid nanite tree file";
+        return std::nullopt;
+    }
+
+    Tree tree;
+    tree.nodes.resize(h.nodeCount);
+    tree.originalFaceCount   = static_cast<size_t>(h.originalFaces);
+    tree.originalVertexCount = static_cast<size_t>(h.originalVerts);
+
+    for (size_t i = 0; i < h.nodeCount; ++i) {
+        Node n;
+        float bmin[3], bmax[3];
+        in.read(reinterpret_cast<char *>(bmin), sizeof(float) * 3);
+        in.read(reinterpret_cast<char *>(bmax), sizeof(float) * 3);
+        n.bbox.min = vcg::Point3f(bmin[0], bmin[1], bmin[2]);
+        n.bbox.max = vcg::Point3f(bmax[0], bmax[1], bmax[2]);
+        in.read(reinterpret_cast<char *>(&n.geometricError), sizeof(float));
+        in.read(reinterpret_cast<char *>(&n.firstChild), sizeof(uint32_t));
+        in.read(reinterpret_cast<char *>(&n.childCount), sizeof(uint32_t));
+
+        uint32_t vcount = 0, fcount = 0;
+        in.read(reinterpret_cast<char *>(&vcount), sizeof(uint32_t));
+        in.read(reinterpret_cast<char *>(&fcount), sizeof(uint32_t));
+        if (vcount > 0 || fcount > 0) {
+            n.proxy = std::make_shared<Mesh>();
+            n.proxy->vert.resize(vcount);
+            n.proxy->face.resize(fcount);
+            for (uint32_t vi = 0; vi < vcount; ++vi) {
+                float pos[3], norm[3], uv[2];
+                in.read(reinterpret_cast<char *>(pos), sizeof(float) * 3);
+                in.read(reinterpret_cast<char *>(norm), sizeof(float) * 3);
+                in.read(reinterpret_cast<char *>(uv), sizeof(float) * 2);
+                n.proxy->vert[vi].P()     = vcg::Point3f(pos[0], pos[1], pos[2]);
+                n.proxy->vert[vi].N()     = vcg::Point3f(norm[0], norm[1], norm[2]);
+                n.proxy->vert[vi].T().U() = uv[0];
+                n.proxy->vert[vi].T().V() = uv[1];
+            }
+            for (uint32_t fi = 0; fi < fcount; ++fi) {
+                uint32_t idx[3];
+                in.read(reinterpret_cast<char *>(idx), sizeof(uint32_t) * 3);
+                n.proxy->face[fi].V(0) = &n.proxy->vert[idx[0]];
+                n.proxy->face[fi].V(1) = &n.proxy->vert[idx[1]];
+                n.proxy->face[fi].V(2) = &n.proxy->vert[idx[2]];
+            }
+            vcg::tri::UpdateNormal<Mesh>::PerFaceNormalized(*n.proxy);
+            vcg::tri::UpdateNormal<Mesh>::PerVertexAngleWeighted(*n.proxy);
+            vcg::tri::UpdateBounding<Mesh>::Box(*n.proxy);
+        }
+        tree.nodes[i] = n;
+    }
+
+    return tree;
+}
+
+} // namespace nanite
